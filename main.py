@@ -7,6 +7,27 @@ import pandas as pd
 import requests
 from matplotlib import dates
 
+
+
+# Helper: append one line to data/gex_history.csv
+def log_to_csv(ticker: str, total_bn: float):
+    """Append today's total GEX to CSV"""
+    from pathlib import Path
+    import datetime as dt
+
+    csv_path = Path("data/gex_history.csv")
+    csv_path.parent.mkdir(exist_ok=True)
+    need_header = not csv_path.exists()
+
+    with csv_path.open("a") as f:
+        if need_header:
+            f.write("date,ticker,gex_bn\n")
+        f.write(f"{dt.date.today()}, {ticker}. {total_bn}\n")
+        
+
+
+
+
 # Set plot style
 plt.style.use("seaborn-dark")
 for param in ["figure.facecolor", "axes.facecolor", "savefig.facecolor"]:
@@ -77,7 +98,7 @@ def compute_total_gex(spot, data):
     # For put option we assume negative gamma, i.e. dealers sell puts and buy calls
     data["GEX"] = data.apply(lambda x: -x.GEX if x.type == "P" else x.GEX, axis=1)
     print(f"Total notional GEX: ${round(data.GEX.sum() / 10 ** 9, 4)} Bn")
-
+    log_to_csv(ticker, round(data.GEX.sum() / 10**9, 4))
 
 def compute_gex_by_strike(spot, data):
     """Compute and plot GEX by strike"""

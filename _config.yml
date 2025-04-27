@@ -1,1 +1,4 @@
 theme: jekyll-theme-slate
+save_format: csv
+csv_path: data/gex_history.csv
+
