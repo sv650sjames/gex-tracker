@@ -1,185 +1,133 @@
-import json
-import os
-from datetime import timedelta, datetime
+#!/usr/bin/env python
+# main.py ─ yfinance-based gamma tracker with on-the-fly Black-Scholes gamma
 
-import matplotlib.pyplot as plt
+import argparse, datetime as dt, json, math
+from pathlib import Path
+from datetime import datetime, timezone  # Add this import
+
+import numpy as np
 import pandas as pd
-import requests
-from matplotlib import dates
+import yfinance as yf
 
+CONTRACT_SIZE = 100              # OCC equity option contract size
+RISK_FREE     = 0.02             # default risk-free rate (2 %)
 
+# ────────────────────────── Black-Scholes helpers ─────────────────────────
+def _norm_pdf(x):          # standard-normal pdf
+    return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
 
-# Helper: append one line to data/gex_history.csv
+def bs_gamma(spot, strike, t, iv, r=RISK_FREE):
+    """Return Black-Scholes gamma for either put or call."""
+    if t <= 0 or iv <= 0:
+        return 0.0
+    d1 = (math.log(spot / strike) + (r + 0.5 * iv * iv) * t) / (iv * math.sqrt(t))
+    return _norm_pdf(d1) / (spot * iv * math.sqrt(t))
+
+# ───────────────────────────── Helpers ────────────────────────────────────
 def log_to_csv(ticker: str, total_bn: float):
-    """Append today's total GEX to CSV"""
-    from pathlib import Path
-    import datetime as dt
-
     csv_path = Path("data/gex_history.csv")
     csv_path.parent.mkdir(exist_ok=True)
-    need_header = not csv_path.exists()
-
+    header = not csv_path.exists()
     with csv_path.open("a") as f:
-        if need_header:
+        if header:
             f.write("date,ticker,gex_bn\n")
-        f.write(f"{dt.date.today()}, {ticker}. {total_bn}\n")
-        
+        f.write(f"{dt.date.today()},{ticker},{total_bn}\n")
 
-
-
-
-# Set plot style
-plt.style.use("seaborn-dark")
-for param in ["figure.facecolor", "axes.facecolor", "savefig.facecolor"]:
-    plt.rcParams[param] = "#212946"
-for param in ["text.color", "axes.labelcolor", "xtick.color", "ytick.color"]:
-    plt.rcParams[param] = "0.9"
-
-contract_size = 100
-
-
-def run(ticker):
-    spot_price, option_data = scrape_data(ticker)
-    compute_total_gex(spot_price, option_data)
-    compute_gex_by_strike(spot_price, option_data)
-    compute_gex_by_expiration(option_data)
-    print_gex_surface(spot_price, option_data)
-
-
-def scrape_data(ticker):
-    """Scrape data from CBOE website"""
-    # Check if data is already downloaded
-    if f"{ticker}.json" in os.listdir("data"):
-        f = open(f"data/{ticker}.json")
-        data = pd.DataFrame.from_dict(json.load(f))
-    else:
-        # Request data and save it to file
-        try:
-            data = requests.get(
-                f"https://cdn.cboe.com/api/global/delayed_quotes/options/_{ticker}.json"
-            )
-            with open(f"data/{ticker}.json", "w") as f:
-                json.dump(data.json(), f)
-
-        except ValueError:
-            data = requests.get(
-                f"https://cdn.cboe.com/api/global/delayed_quotes/options/{ticker}.json"
-            )
-            with open(f"data/{ticker}.json", "w") as f:
-                json.dump(data.json(), f)
-        # Convert json to pandas DataFrame
-        data = pd.DataFrame.from_dict(data.json())
-
-    spot_price = data.loc["current_price", "data"]
-    option_data = pd.DataFrame(data.loc["options", "data"])
-
-    return spot_price, fix_option_data(option_data)
-
-
-def fix_option_data(data):
+def log_top_strikes(ticker: str, gex_top: pd.Series):
     """
-    Fix option data columns.
-
-    From the name of the option derive type of option, expiration and strike price
+    Append 5 strike / gamma pairs to data/top_gamma.csv
+    Columns: date, ticker, strike, gex_bn
     """
-    data["type"] = data.option.str.extract(r"\d([A-Z])\d")
-    data["strike"] = data.option.str.extract(r"\d[A-Z](\d+)\d\d\d").astype(int)
-    data["expiration"] = data.option.str.extract(r"[A-Z](\d+)").astype(str)
-    # Convert expiration to datetime format
-    data["expiration"] = pd.to_datetime(data["expiration"], format="%y%m%d")
-    return data
+    csv = Path("data/top_gamma.csv")
+    csv.parent.mkdir(exist_ok=True)
+    header = not csv.exists()
+    today  = dt.date.today()
+
+    with csv.open("a") as f:
+        if header:
+            f.write("date,ticker,strike,gex_bn\n")
+        for strike, gex in gex_top.items():
+            f.write(f"{today},{ticker},{strike},{round(gex,4)}\n")
+
+ 
+
+def top_gamma_strikes(df: pd.DataFrame, spot: float, n=5):
+    gex = (spot**2 * df.gamma * df.open_interest * CONTRACT_SIZE / 1e9)
+    gex[df.type == "P"] *= -1
+    by_strike = gex.groupby(df.strike).sum()
+    order = by_strike.abs().sort_values(ascending=False).index
+    return by_strike.loc[order].head(n)
+
+# ───────────────────── Fetch & gamma-compute via yfinance ─────────────────
+def fetch_chain_and_spot(ticker: str, r_rate: float):
+    yf_sym = ticker if ticker.startswith("^") else ticker
+    tk     = yf.Ticker(yf_sym)
+
+    spot = float(tk.info["regularMarketPrice"])
+    expiry_str = tk.options[0]                         # ← "YYYY-MM-DD"
+    exp_date   = dt.datetime.strptime(expiry_str, "%Y-%m-%d").date()
+    t_years    = (exp_date - datetime.now(timezone.utc).date()).days / 365.0
+
+    chain = tk.option_chain(expiry_str)                # explicit expiry
+
+    def _prep(df, cp_flag):
+        df = df.copy()
+        df["type"] = cp_flag
+        iv = df.impliedVolatility.fillna(0).astype(float)
+        gamma = [bs_gamma(spot, k, t_years, v, r_rate)
+                 for k, v in zip(df.strike, iv)]
+        df["gamma"] = gamma
+        df.rename(columns={"openInterest": "open_interest"}, inplace=True)
+        return df[["strike", "type", "gamma", "open_interest"]]
+
+    calls = _prep(chain.calls, "C")
+    puts  = _prep(chain.puts,  "P")
+    out   = pd.concat([calls, puts], ignore_index=True)
+    return spot, out, chain
 
 
-def compute_total_gex(spot, data):
-    """Compute dealers' total GEX"""
-    # Compute gamma exposure for each option
-    data["GEX"] = spot * data.gamma * data.open_interest * contract_size * spot * 0.01
+# ────────────────────────── Business logic ───────────────────────────────
+def compute_total_gex(spot, df, ticker):
+    gex = spot**2 * df.gamma * df.open_interest * CONTRACT_SIZE / 1e9
+    gex[df.type == "P"] *= -1
+    total_bn = round(gex.sum(), 4)
 
-    # For put option we assume negative gamma, i.e. dealers sell puts and buy calls
-    data["GEX"] = data.apply(lambda x: -x.GEX if x.type == "P" else x.GEX, axis=1)
-    print(f"Total notional GEX: ${round(data.GEX.sum() / 10 ** 9, 4)} Bn")
-    log_to_csv(ticker, round(data.GEX.sum() / 10**9, 4))
+    print(f"\nTotal notional GEX: ${total_bn} Bn")
+    log_to_csv(ticker, total_bn)
 
-def compute_gex_by_strike(spot, data):
-    """Compute and plot GEX by strike"""
-    # Compute total GEX by strike
-    gex_by_strike = data.groupby("strike")["GEX"].sum() / 10**9
-
-    # Limit data to +- 15% from spot price
-    limit_criteria = (gex_by_strike.index > spot * 0.85) & (gex_by_strike.index < spot * 1.15)
-
-    # Plot GEX by strike
-    plt.bar(
-        gex_by_strike.loc[limit_criteria].index,
-        gex_by_strike.loc[limit_criteria],
-        color="#FE53BB",
-        alpha=0.5,
-    )
-    plt.grid(color="#2A3459")
-    plt.xticks(fontweight="heavy")
-    plt.yticks(fontweight="heavy")
-    plt.xlabel("Strike", fontweight="heavy")
-    plt.ylabel("Gamma Exposure (Bn$ / %)", fontweight="heavy")
-    plt.title(f"{ticker} GEX by strike", fontweight="heavy")
-    plt.show()
+    gex_top = top_gamma_strikes(df, spot)
+    print("\nTop gamma strikes ($ Bn):")
+    #print(top_gamma_strikes(df, spot).to_string(float_format="%.2f"))
+    print(gex_top.to_string(float_format="%.2f"))
+    log_top_strikes(ticker, gex_top)
 
 
-def compute_gex_by_expiration(data):
-    """Compute and plot GEX by expiration"""
-    # Limit data to one year
-    selected_date = datetime.today() + timedelta(days=365)
-    data = data.loc[data.expiration < selected_date]
+def run(ticker, save_json, r_rate):
+    spot, opt_df, raw = fetch_chain_and_spot(ticker, r_rate)
+    # if save_json:
+    #     jp = Path("data") / f"{ticker}.json"
+    #     jp.write_text(json.dumps(raw))
+    #     print(f"raw JSON saved → {jp}")
 
-    # Compute GEX by expiration date
-    gex_by_expiration = data.groupby("expiration")["GEX"].sum() / 10**9
+    spot, opt_df, raw = fetch_chain_and_spot(ticker, r_rate)
 
-    # Plot GEX by expiration
-    plt.bar(
-        gex_by_expiration.index,
-        gex_by_expiration.values,
-        color="#FE53BB",
-        alpha=0.5,
-    )
-    plt.grid(color="#2A3459")
-    plt.xticks(rotation=45, fontweight="heavy")
-    plt.yticks(fontweight="heavy")
-    plt.xlabel("Expiration date", fontweight="heavy")
-    plt.ylabel("Gamma Exposure (Bn$ / %)", fontweight="heavy")
-    plt.title(f"{ticker} GEX by expiration", fontweight="heavy")
-    plt.show()
+    if save_json:
+        jp = Path("data") / f"{ticker}.json"
+        jp.write_text(json.dumps(raw, default=str))
+        print(f"raw JSON saved → {jp}")
 
+    compute_total_gex(spot, opt_df, ticker)
 
-def print_gex_surface(spot, data):
-    """Plot 3D surface"""
-    # Limit data to 1 year and +- 15% from ATM
-    selected_date = datetime.today() + timedelta(days=365)
-    limit_criteria = (
-        (data.expiration < selected_date)
-        & (data.strike > spot * 0.85)
-        & (data.strike < spot * 1.15)
-    )
-    data = data.loc[limit_criteria]
-
-    # Compute GEX by expiration and strike
-    data = data.groupby(["expiration", "strike"])["GEX"].sum() / 10**6
-    data = data.reset_index()
-
-    # Plot 3D surface
-    fig = plt.figure()
-    ax = fig.add_subplot(111, projection="3d")
-    ax.plot_trisurf(
-        data["strike"],
-        dates.date2num(data["expiration"]),
-        data["GEX"],
-        cmap="seismic_r",
-    )
-    ax.yaxis.set_major_formatter(dates.AutoDateFormatter(ax.xaxis.get_major_locator()))
-    ax.set_ylabel("Expiration date", fontweight="heavy")
-    ax.set_xlabel("Strike Price", fontweight="heavy")
-    ax.set_zlabel("Gamma (M$ / %)", fontweight="heavy")
-    plt.show()
-
-
+# ────────────────────────────── CLI ───────────────────────────────────────
 if __name__ == "__main__":
-    ticker = input("Enter desired ticker:").upper()
-    run(ticker)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ticker", help="symbol (e.g. QQQ, ^SPX)")
+    ap.add_argument("--save_json", action="store_true")
+    ap.add_argument("--risk_free", type=float, default=RISK_FREE, help="risk-free rate (decimal)")
+    args = ap.parse_args()
+
+    ticker = args.ticker.upper() if args.ticker else input("Enter ticker: ").upper()
+    if not ticker.replace("^", "").isalpha():
+        raise ValueError("Ticker must be letters, optionally starting with ^ for indices.")
+
+    run(ticker, args.save_json, args.risk_free)
